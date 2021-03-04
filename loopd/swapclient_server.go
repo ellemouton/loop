@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/btcsuite/btcd/chaincfg"
+
 	"github.com/btcsuite/btcutil"
 	"github.com/lightninglabs/lndclient"
 	"github.com/lightninglabs/loop"
@@ -34,6 +36,17 @@ const (
 	minConfTarget = 2
 )
 
+var (
+	// errIncorrectChain is returned when the format of the
+	// destination address provided does not match the active chain.
+	errIncorrectChain = errors.New("invalid address format for the " +
+		"active chain")
+
+	// errConfTargetTooLow is returned when the chosen confirmation target
+	// is below the allowed minimum.
+	errConfTargetTooLow = errors.New("confirmation target too low")
+)
+
 // swapClientServer implements the grpc service exposed by loopd.
 type swapClientServer struct {
 	network          lndclient.Network
@@ -58,13 +71,6 @@ func (s *swapClientServer) LoopOut(ctx context.Context,
 
 	log.Infof("Loop out request received")
 
-	sweepConfTarget, err := validateConfTarget(
-		in.SweepConfTarget, loop.DefaultSweepConfTarget,
-	)
-	if err != nil {
-		return nil, err
-	}
-
 	var sweepAddr btcutil.Address
 	if in.Dest == "" {
 		// Generate sweep address if none specified.
@@ -83,8 +89,9 @@ func (s *swapClientServer) LoopOut(ctx context.Context,
 		}
 	}
 
-	// Check that the label is valid.
-	if err := labels.Validate(in.Label); err != nil {
+	sweepConfTarget, err := validateLoopOutRequest(s.lnd.ChainParams,
+		in.SweepConfTarget, sweepAddr, in.Label)
+	if err != nil {
 		return nil, err
 	}
 
@@ -894,8 +901,9 @@ func validateConfTarget(target, defaultTarget int32) (int32, error) {
 
 	// Ensure the target respects our minimum threshold.
 	case target < minConfTarget:
-		return 0, fmt.Errorf("a confirmation target of at least %v "+
+		log.Errorf("a confirmation target of at least %v "+
 			"must be provided", minConfTarget)
+		return 0, errConfTargetTooLow
 
 	default:
 		return target, nil
@@ -919,4 +927,25 @@ func validateLoopInRequest(htlcConfTarget int32, external bool) (int32, error) {
 	}
 
 	return validateConfTarget(htlcConfTarget, loop.DefaultHtlcConfTarget)
+}
+
+// validateLoopOutRequest validates the confirmation target, destination
+// address and label of the loop out request.
+func validateLoopOutRequest(chainParams *chaincfg.Params, confTarget int32,
+	sweepAddr btcutil.Address, label string) (int32, error) {
+
+	// Check that the provided destination address has the correct format
+	// for the active network.
+	if !sweepAddr.IsForNet(chainParams) {
+		log.Errorf("destination address format does not match "+
+			"the active network: %s", chainParams.Name)
+		return 0, errIncorrectChain
+	}
+
+	// Check that the label is valid.
+	if err := labels.Validate(label); err != nil {
+		return 0, err
+	}
+
+	return validateConfTarget(confTarget, loop.DefaultSweepConfTarget)
 }
