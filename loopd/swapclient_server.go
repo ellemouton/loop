@@ -44,6 +44,13 @@ var (
 	// errConfTargetTooLow is returned when the chosen confirmation target
 	// is below the allowed minimum.
 	errConfTargetTooLow = errors.New("confirmation target too low")
+
+	// errBalanceTooLow is returned when the loop out amount cant
+	//be satisfied given total balance of the selection of channels to
+	// loop out on.
+	errBalanceTooLow = errors.New(
+		"channel balance too low for loop out amount",
+	)
 )
 
 // swapClientServer implements the grpc service exposed by loopd.
@@ -89,7 +96,7 @@ func (s *swapClientServer) LoopOut(ctx context.Context,
 	}
 
 	sweepConfTarget, err := validateLoopOutRequest(
-		s.lnd.ChainParams, in.SweepConfTarget, sweepAddr, in.Label,
+		ctx, s.lnd.Client, s.lnd.ChainParams, in, sweepAddr,
 	)
 	if err != nil {
 		return nil, err
@@ -982,8 +989,10 @@ func validateLoopInRequest(htlcConfTarget int32, external bool) (int32, error) {
 
 // validateLoopOutRequest validates the confirmation target, destination
 // address and label of the loop out request.
-func validateLoopOutRequest(chainParams *chaincfg.Params, confTarget int32,
-	sweepAddr btcutil.Address, label string) (int32, error) {
+func validateLoopOutRequest(ctx context.Context, lnd lndclient.LightningClient,
+	chainParams *chaincfg.Params, req *looprpc.LoopOutRequest,
+	sweepAddr btcutil.Address) (int32, error) {
+
 	// Check that the provided destination address has the correct format
 	// for the active network.
 	if !sweepAddr.IsForNet(chainParams) {
@@ -992,9 +1001,57 @@ func validateLoopOutRequest(chainParams *chaincfg.Params, confTarget int32,
 	}
 
 	// Check that the label is valid.
-	if err := labels.Validate(label); err != nil {
+	if err := labels.Validate(req.Label); err != nil {
 		return 0, err
 	}
 
-	return validateConfTarget(confTarget, loop.DefaultSweepConfTarget)
+	channels, err := lnd.ListChannels(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	outgoingChanSetMap := make(map[uint64]bool)
+	for _, c := range req.OutgoingChanSet {
+		outgoingChanSetMap[c] = true
+	}
+
+	var totalOutgoingCapacity btcutil.Amount
+	for _, c := range channels {
+		// Don't bother adding the local balance of an inactive channel.
+		if !c.Active {
+			continue
+		}
+
+		// If no outgoing channel set was given then the entire set of
+		// active channels is considered.
+		if len(outgoingChanSetMap) == 0 {
+			totalOutgoingCapacity += c.LocalBalance
+			continue
+		}
+
+		// If a channel set was specified then only the specified
+		// channels are considered.
+		if !outgoingChanSetMap[c.ChannelID] {
+			continue
+		}
+
+		totalOutgoingCapacity += c.LocalBalance
+	}
+
+	// Determine if the total outgoing capacity of the channel set is
+	// enough to satisfy the loop amount and the maximum possible
+	// routing fees that could be charged.
+	if req.Amt+req.MaxSwapRoutingFee >
+		int64(totalOutgoingCapacity.ToUnit(btcutil.AmountSatoshi)) {
+		return 0, fmt.Errorf("%w: Requested swap amount of %d "+
+			"sats along with the maximum routing fee of %d sats "+
+			"is more than the available outgoing capacity of %d "+
+			"sats",
+			errBalanceTooLow, req.Amt, req.MaxSwapRoutingFee,
+			totalOutgoingCapacity)
+	}
+
+	return validateConfTarget(
+		req.SweepConfTarget, loop.DefaultSweepConfTarget,
+	)
 }
