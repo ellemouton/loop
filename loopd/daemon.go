@@ -390,13 +390,19 @@ func (d *Daemon) initialize(withMacaroonService bool) error {
 	}
 
 	if withMacaroonService {
+		rks, err := lndclient.NewBoltMacaroonStore(
+			d.cfg.DataDir, "macaroons.db",
+			loopdb.DefaultLoopDBTimeout,
+		)
+		if err != nil {
+			return err
+		}
+
 		// Start the macaroon service and let it create its default
 		// macaroon in case it doesn't exist yet.
 		d.macaroonService, err = lndclient.NewMacaroonService(
 			&lndclient.MacaroonServiceConfig{
-				DBPath:           d.cfg.DataDir,
-				DBFileName:       "macaroons.db",
-				DBTimeout:        loopdb.DefaultLoopDBTimeout,
+				RootKeyStore:     rks,
 				MacaroonLocation: loopMacaroonLocation,
 				MacaroonPath:     d.cfg.MacaroonPath,
 				Checkers: []macaroons.Checker{
